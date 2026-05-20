@@ -1,39 +1,13 @@
 import os
 import uuid
-import requests
+import aspose.words as aw
 from django.conf import settings
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.parsers import MultiPartParser, FormParser
-from pdf2image import convert_from_path
-import pytesseract
 from docx import Document
 from docx.shared import Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-
-# 1. إعداد مسار Tesseract
-pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-
-# 2. إعداد المفتاح
-GEMINI_API_KEY = 'AIzaSyC_-_c7VOQ79KOVLMPDefoY5a272wdNn6k'
-
-def get_available_model():
-    """هذه الدالة تستخرج النموذج الصحيح والمسموح به لمفتاحك تلقائياً"""
-    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={GEMINI_API_KEY}"
-    response = requests.get(url)
-    if response.status_code == 200:
-        models = response.json().get('models', [])
-        # نبحث عن نموذج يدعم توليد النصوص (generateContent)
-        for model in models:
-            if 'generateContent' in model.get('supportedGenerationMethods', []):
-                # نفضل نماذج flash لأنها أسرع وأفضل للنصوص
-                if 'flash' in model['name']:
-                    return model['name']
-        # إذا لم يجد flash، يرجع أول نموذج متاح
-        for model in models:
-             if 'generateContent' in model.get('supportedGenerationMethods', []):
-                 return model['name']
-    return "models/gemini-1.5-flash" # نموذج احتياطي أخير
 
 class PDFToWordView(APIView):
     parser_classes = (MultiPartParser, FormParser)
@@ -52,48 +26,30 @@ class PDFToWordView(APIView):
                 f.write(chunk)
 
         try:
-            # 1. قراءة الـ PDF بالـ OCR
-            pages = convert_from_path(pdf_path, 300, poppler_path=r'C:\poppler-26.02.0\Library\bin')
-            extracted_text = ""
+            # 1. استخراج النص باستخدام Aspose
+            loadOptions = aw.loading.PdfLoadOptions()
+            pdf_doc = aw.Document(pdf_path, loadOptions)
+            raw_text = pdf_doc.to_string(aw.SaveFormat.TEXT)
+
+            # تنظيف العلامة المائية لـ Aspose
+            clean_text = raw_text.replace("Evaluation Only. Created with Aspose.Words. Copyright 2003-2024 Aspose Pty Ltd.", "")
+            clean_text = clean_text.replace("Created with an evaluation copy of Aspose.Words. To discover the full versions of our APIs please visit: https://products.aspose.com/words/", "")
             
-            for page in pages:
-                text = pytesseract.image_to_string(page, lang='ara')
-                extracted_text += text + "\n"
+            lines = [line.strip() for line in clean_text.split('\n') if line.strip()]
+            extracted_text = '\n'.join(lines)
 
-            # 2. تحديد النموذج الديناميكي
-            model_name = get_available_model()
-            
-            prompt = f"""
-            أنت سكرتير تنفيذي محترف. النص التالي تم استخراجه من تقرير أمني عربي عبر OCR ويحتوي على أخطاء وتنسيق عشوائي.
-            
-            المطلوب:
-            1. صحح الأخطاء الإملائية.
-            2. رتب التقرير بشكل هرمي واضح.
-            3. استخدم الترقيم (1.  أو 2. ) للعناوين، واستخدم الشرطة (-) للبنود الفرعية.
-            4. تأكد أن النص نظيف تماماً.
-            5. أعد النص فقط بدون أي تعليقات أو علامات ماركداون (** أو #).
+            print(f"حجم النص المستخرج: {len(extracted_text)} حرف")
 
-            النص:
-            {extracted_text}
-            """
+            if not extracted_text.strip():
+                raise Exception("المستند فارغ أو عبارة عن صور فقط.")
 
-            # 3. إرسال الطلب باستخدام النموذج المكتشف
-            url = f"https://generativelanguage.googleapis.com/v1beta/{model_name}:generateContent?key={GEMINI_API_KEY}"
-            headers = {'Content-Type': 'application/json'}
-            data = {
-                "contents": [{"parts": [{"text": prompt}]}]
-            }
+            # ==========================================
+            # 2. تخطي الذكاء الاصطناعي (مؤقتاً للاختبار)
+            # ==========================================
+            # نأخذ النص المستخرج ونعطيه مباشرة لمتغير الوورد
+            clean_formatted_text = extracted_text 
 
-            response = requests.post(url, headers=headers, json=data)
-            response_data = response.json()
-
-            if response.status_code != 200:
-                error_msg = response_data.get('error', {}).get('message', 'Unknown Error')
-                raise Exception(f"Google API Error: {error_msg}")
-
-            clean_formatted_text = response_data['candidates'][0]['content']['parts'][0]['text']
-
-            # 4. كتابة ملف الوورد مع دعم الاتجاه العربي (RTL)
+            # 3. كتابة ملف الوورد مع دعم الاتجاه العربي (RTL) الصارم
             doc = Document()
             from docx.oxml import OxmlElement
             from docx.oxml.ns import qn
@@ -104,12 +60,13 @@ class PDFToWordView(APIView):
                 if not line:
                     continue
                 
-                clean_line = line.replace('**', '').replace('#', '').strip()
-                clean_line = '\u200F' + clean_line
+                # إضافة علامة (RLM) المخفية في بداية النص لإجبار الرموز على البقاء يميناً
+                clean_line = '\u200F' + line
 
                 p = doc.add_paragraph()
                 p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
                 
+                # إجبار الفقرة على الاتجاه العربي
                 pPr = p._element.get_or_add_pPr()
                 bidi = OxmlElement('w:bidi')
                 bidi.set(qn('w:val'), '1')
@@ -117,6 +74,7 @@ class PDFToWordView(APIView):
                 
                 run = p.add_run(clean_line)
                 
+                # إجبار الحروف على الاتجاه العربي وتحديد اللغة
                 rPr = run._element.get_or_add_rPr()
                 rtl = OxmlElement('w:rtl')
                 rtl.set(qn('w:val'), '1')
@@ -127,12 +85,7 @@ class PDFToWordView(APIView):
                 rPr.append(lang)
                 
                 run.font.name = 'Arial' 
-
-                if clean_line and len(clean_line) > 1 and (clean_line[1].isdigit() or "وزارة" in clean_line or "قيادة" in clean_line or "الملخص" in clean_line):
-                    run.bold = True
-                    run.font.size = Pt(14)
-                else:
-                    run.font.size = Pt(12)
+                run.font.size = Pt(12)
 
             doc.save(docx_path)
             file_url = request.build_absolute_uri(f"{settings.MEDIA_URL}converted_{unique_id}.docx")
@@ -140,7 +93,7 @@ class PDFToWordView(APIView):
 
         except Exception as e:
             print(f"Error Output: {str(e)}")
-            return Response({'error': f'فشل التحويل: {str(e)}'}, status=500)
+            return Response({'error': str(e)}, status=500)
         
         finally:
             if os.path.exists(pdf_path):
